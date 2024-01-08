@@ -2,9 +2,10 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <strings.h>
 #include <time.h>
-
+#include <cstring>
+#include <sstream>
+#include "pocsag.h"
 //Check out main() at the bottom of the file
 //You can modify MIN_DELAY and MAX_DELAY to fit your needs.
 
@@ -394,70 +395,53 @@ void pcmEncodeTransmission(
 #define MIN_DELAY 1
 #define MAX_DELAY 10
 
-int main() {
-    //Read in lines from STDIN.
-    //Lines are in the format of address:message
-    //The program will encode transmissions for each message, writing them
-    //to STDOUT. It will also encode a rand amount of silence between them,
-    //from 1-10 seconds in length, to act as a simulated "delay".
-    char line[65536];
-    srand(time(NULL));
-    for (;;) {
-
-        if (fgets(line, sizeof(line), stdin) == NULL) {
-            //Exit on EOF
-            return 0;
+size_t getColonIndex(char* line) {
+    // Find the colon separating the address from the message
+    // returns -1 if no colon is found
+    size_t colonIndex = 0;
+    for (size_t i = 0; i < sizeof(line); i++) {
+        if (line[i] == 0) {
+            return -1;
         }
-
-        size_t colonIndex = 0;
-        for (size_t i = 0; i < sizeof(line); i++) {
-            if (line[i] == 0) {
-                fputs("Malformed Line!", stderr);
-                return 1;
-            }
-            if (line[i] == ':') {
-                colonIndex = i;
-                break;
-            }
+        if (line[i] == ':') {
+            colonIndex = i;
+            return colonIndex;
         }
-
-        int address = (int) strtol(line, NULL, 10);
-        char* message = line + colonIndex + 1;
-
-        size_t messageLength = textMessageLength(address, strlen(message));
-
-        uint32_t* transmission =
-            (uint32_t*) malloc(sizeof(uint32_t) * messageLength);
-
-        encodeTransmission(address, message, transmission);
-
-        size_t pcmLength =
-            pcmTransmissionLength(SAMPLE_RATE, BAUD_RATE, messageLength);
-
-        uint8_t* pcm =
-            (uint8_t*) malloc(sizeof(uint8_t) * pcmLength);
-
-        pcmEncodeTransmission(
-                SAMPLE_RATE, BAUD_RATE, transmission, messageLength, pcm);
-
-        //Write as series of little endian 16 bit samples
-        fwrite(pcm, sizeof(uint8_t), pcmLength, stdout);
-
-        free(transmission);
-        free(pcm);
-
-        //Generate rand amount of silence. Silence is a sample with
-        //a value of 0.
-        
-        //1-10 seconds
-        size_t silenceLength = rand() % (SAMPLE_RATE * (MAX_DELAY - MIN_DELAY)) + MIN_DELAY;
-
-        //Since the values are zero, endianness doesn't matter here
-        uint16_t* silence =
-            (uint16_t*) malloc(sizeof(uint16_t) * silenceLength);
-
-        bzero(silence, sizeof(uint16_t) * silenceLength);
-        fwrite(silence, sizeof(uint16_t), silenceLength, stdout);
-        free(silence);
     }
+    return -1;
+}
+
+uint32_t* encodeString(std::string input) {
+    //Encode a string as a series of codewords
+    //Returns a pointer to the first codeword
+    //The caller is responsible for freeing the memory
+    //allocated by this function
+    uint32_t* transmission = (uint32_t*) malloc(sizeof(uint32_t) * input.length());
+    encodeASCII(0, (char*) input.c_str(), transmission);
+    return transmission;
+}
+
+std::string decodePOCSAG(uint32_t* signal) {
+    //Decode a POCSAG signal into a string
+    //Returns a string containing the decoded message
+    //The caller is responsible for freeing the memory
+    //allocated by this function
+    std::string output = "";
+    uint32_t* currentWord = signal;
+    while (*currentWord != IDLE) {
+        uint32_t word = *currentWord;
+        uint32_t data = word >> 2;
+        uint32_t type = data & 0x3;
+        if (type == FLAG_TEXT_DATA) {
+            //This is a text message
+            for (int i = 0; i < 10; i++) {
+                uint32_t character = data >> (TEXT_BITS_PER_WORD - TEXT_BITS_PER_CHAR * (i + 1));
+                character &= 0x7F;
+                output += (char) character;
+            }
+        }
+        currentWord++;
+    }
+    return output;
+
 }
