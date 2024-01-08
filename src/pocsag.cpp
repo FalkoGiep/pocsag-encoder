@@ -6,6 +6,7 @@
 #include <cstring>
 #include <sstream>
 #include "pocsag.h"
+#include <iostream>
 //Check out main() at the bottom of the file
 //You can modify MIN_DELAY and MAX_DELAY to fit your needs.
 
@@ -230,7 +231,7 @@ void encodeTransmission(int address, char* message, uint32_t* out) {
     *out = SYNC;
     out++;
 
-    //Write out padding before adderss word
+    //Write out padding before address word
     int prefixLength = addressOffset(address);
     for (int i = 0; i < prefixLength; i++) {
         *out = IDLE;
@@ -297,103 +298,6 @@ size_t textMessageLength(int address, int numChars) {
     return numWords;
 }
 
-//=== ALRIGHTY, time for some stuff completely unrelated to POCSAG itself. ===
-//We need to be able to encode this data as PCM audio for multimon-ng to decode.
-//It expects input at a sample rate of 22050 Hz, but that does not divide well
-//into any of the valid POCSAG baud rates of 512, 1200, or 2400. So instead,
-//we're going to encode data at a sample rate of 38400 Hz, which is an evenly
-//divisible by all of those baud rates, and then "resample" to 22050 Hz  with no
-//interpolation whatsoever. Audio engineers would hate me here...
-
-
-//Samples are 16 bit signed PCM audio samples.
-//A negative value represents 1, while a positive value represents 0
-//No value represents a pause in the signal
-
-#define SYMRATE 38400
-
-size_t pcmTransmissionLength(
-        uint32_t sampleRate,
-        uint32_t baudRate,
-        size_t transmissionLength) {
-    //32 bits per word * (sampleRate / baudRate) samples.
-    //Each sample is 16 bits, but we encode to an 8 bit array.
-    return transmissionLength * 32 * sampleRate / baudRate * 2;
-}
-
-/**
- * sampleRate: Sample rate of output data
- * baudRate: Baud rate ouf output data
- * (*transmission): POCSAG-encoded message to transmit
- * transmissionLength: length in words of the transmission
- * (*out): Destination for output audio samples. Should be at least
- *         (transmissionLength * 32 * sampleRate / baudRate * 2) bytes in size.
- */
-void pcmEncodeTransmission(
-        uint32_t sampleRate,
-        uint32_t baudRate,
-        uint32_t* transmission,
-        size_t transmissionLength,
-        uint8_t* out) {
-
-    //Number of times we need to repeat each bit to achieve SYMRATE
-    int repeatsPerBit = SYMRATE / baudRate;
-
-    //Initial buffer for samples before resampling occurs
-    int16_t* samples =
-        (int16_t*) malloc(sizeof(int16_t) * transmissionLength * 32 * repeatsPerBit);
-
-    
-    //Encode transmission as an audio signal
-    
-    //Pointer to samples we can modify in the loop
-    int16_t* psamples = samples;
-    for (size_t i = 0; i < transmissionLength; i++) {
-
-        //Word to encode
-        uint32_t val = *(transmission + i);
-
-        for (int bitNum = 0; bitNum < 32; bitNum++) {
-
-            //Encode from most significant to least significant bit
-            int bit = (val >> (31 - bitNum)) & 1;
-            int16_t sample;
-            if (bit == 0) {
-                sample = 32767 / 2;
-            } else {
-                sample = -32767 / 2;
-            }
-
-            //Repeat as many times as we need for the current baudrate
-            for (int r = 0; r < repeatsPerBit; r++) {
-                *psamples = sample;
-                psamples++;
-            }
-        }
-    }
-
-    //Resample to 22050 sample rate
-    size_t outputSize =
-        pcmTransmissionLength(sampleRate, baudRate, transmissionLength);
-    for (size_t i = 0; i < outputSize; i += 2) {
-        //Round to closest index in input data which corresponds to output index
-        int16_t inSample = *(samples + (i / 2) * SYMRATE / sampleRate);
-        
-        //Write little-endian
-        *(out + i + 0) = (inSample & 0xFF);
-        *(out + i + 1) = ((inSample >> 8) & 0xFF);
-    }
-
-    //And we're done! Delete our temporary buffer
-    free(samples);
-}
-
-
-#define SAMPLE_RATE 22050
-#define BAUD_RATE 512
-
-#define MIN_DELAY 1
-#define MAX_DELAY 10
 
 size_t getColonIndex(char* line) {
     // Find the colon separating the address from the message
@@ -411,37 +315,42 @@ size_t getColonIndex(char* line) {
     return -1;
 }
 
-uint32_t* encodeString(std::string input) {
-    //Encode a string as a series of codewords
-    //Returns a pointer to the first codeword
-    //The caller is responsible for freeing the memory
-    //allocated by this function
-    uint32_t* transmission = (uint32_t*) malloc(sizeof(uint32_t) * input.length());
-    encodeASCII(0, (char*) input.c_str(), transmission);
-    return transmission;
+size_t encodeString(std::string input, uint32_t* transmission) {
+    int address = 0;
+    size_t transmissionLength = textMessageLength(address, input.length());
+    encodeTransmission(address, (char*)input.c_str(), transmission);
+    return transmissionLength;
 }
 
-std::string decodePOCSAG(uint32_t* signal) {
-    //Decode a POCSAG signal into a string
-    //Returns a string containing the decoded message
-    //The caller is responsible for freeing the memory
-    //allocated by this function
-    std::string output = "";
-    uint32_t* currentWord = signal;
-    while (*currentWord != IDLE) {
-        uint32_t word = *currentWord;
-        uint32_t data = word >> 2;
+std::string decodePOCSAG(uint32_t* transmission, size_t transmissionLength) {
+    std::string message = "";
+    for (int i = 0; i < transmissionLength; i++) {
+        uint32_t codeWord = transmission[i];
+        if (codeWord == 0xAAAAAAAA) {
+            //preamble
+            continue;
+        }
+        if (codeWord == 0x7CD215D8) {
+            //sync
+            std::cout << "found sync" << std::endl;
+            continue;
+        }
+        if (codeWord == 0x7A89C197) {
+            //idle
+            std::cout << "found idle" << std::endl;
+            break;
+        }
+        std::cout << codeWord << std::endl;
+        uint32_t data = codeWord >> 2;
         uint32_t type = data & 0x3;
-        if (type == FLAG_TEXT_DATA) {
-            //This is a text message
-            for (int i = 0; i < 10; i++) {
-                uint32_t character = data >> (TEXT_BITS_PER_WORD - TEXT_BITS_PER_CHAR * (i + 1));
+        if (type == 0x3) {
+            //text data
+            for (int j = 0; j < 10; j++) {
+                uint32_t character = data >> (20 - 7 * j);
                 character &= 0x7F;
-                output += (char) character;
+                message += (char)character;
             }
         }
-        currentWord++;
     }
-    return output;
-
+    return message;
 }
